@@ -104,6 +104,25 @@ std::wstring FormatSize(std::uintmax_t bytes) {
     return buffer;
 }
 
+std::wstring Win32Text(unsigned long code) {
+    wchar_t* buffer = nullptr;
+    const DWORD length = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, static_cast<DWORD>(code), 0, reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+    std::wstring text = (length > 0 && buffer != nullptr)
+                            ? std::wstring(buffer, length)
+                            : L"error " + std::to_wstring(code);
+    if (buffer != nullptr) {
+        LocalFree(buffer);
+    }
+    while (!text.empty() &&
+           (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ')) {
+        text.pop_back();
+    }
+    return text;
+}
+
 void InitConsole() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -221,13 +240,33 @@ bool IsExcelFile(const std::filesystem::path& file) {
            extension == L".xlt" || extension == L".xlam";
 }
 
+bool IsWordFile(const std::filesystem::path& file) {
+    const std::wstring extension = ToLower(file.extension().wstring());
+    return extension == L".docx" || extension == L".docm" || extension == L".dotx" ||
+           extension == L".dotm" || extension == L".doc" || extension == L".dot";
+}
+
+bool IsPdfFile(const std::filesystem::path& file) {
+    return ToLower(file.extension().wstring()) == L".pdf";
+}
+
 bool IsOoxml(const std::filesystem::path& file) {
     const std::wstring extension = ToLower(file.extension().wstring());
     return extension == L".xlsx" || extension == L".xlsm" || extension == L".xlsb" ||
-           extension == L".xltx" || extension == L".xltm" || extension == L".xlam";
+           extension == L".xltx" || extension == L".xltm" || extension == L".xlam" ||
+           extension == L".docx" || extension == L".docm" ||
+           extension == L".dotx" || extension == L".dotm";
 }
 
-ScanResult ScanExcelFiles(const std::filesystem::path& folder, bool recursive) {
+FileType TypeOf(const std::filesystem::path& file) {
+    if (IsExcelFile(file)) return FileType::Excel;
+    if (IsWordFile(file)) return FileType::Word;
+    if (IsPdfFile(file)) return FileType::Pdf;
+    return FileType::Other;
+}
+
+ScanResult ScanFiles(const std::filesystem::path& folder, bool recursive,
+                     const FileTypes& types) {
     namespace fs = std::filesystem;
     ScanResult result;
 
@@ -237,16 +276,20 @@ ScanResult ScanExcelFiles(const std::filesystem::path& folder, bool recursive) {
         return result;
     }
 
-    auto add = [&result](const fs::directory_entry& entry) {
+    auto add = [&result, &types](const fs::directory_entry& entry) {
         std::error_code entryError;
         if (!entry.is_regular_file(entryError)) {
             return;
         }
         const std::wstring name = entry.path().filename().wstring();
         if (name.size() >= 2 && name[0] == L'~' && name[1] == L'$') {
-            return;  // Excel lock file
+            return;  // Excel/Word lock file
         }
-        if (!IsExcelFile(entry.path())) {
+        const FileType type = TypeOf(entry.path());
+        const bool wanted = (type == FileType::Excel && types.excel) ||
+                            (type == FileType::Word && types.word) ||
+                            (type == FileType::Pdf && types.pdf);
+        if (!wanted) {
             return;
         }
         result.files.push_back(entry.path());
@@ -282,6 +325,14 @@ ScanResult ScanExcelFiles(const std::filesystem::path& folder, bool recursive) {
                          ToLower(right.filename().wstring());
               });
     return result;
+}
+
+ScanResult ScanExcelFiles(const std::filesystem::path& folder, bool recursive) {
+    FileTypes types;
+    types.excel = true;
+    types.word = false;
+    types.pdf = false;
+    return ScanFiles(folder, recursive, types);
 }
 
 Container DetectContainer(const std::filesystem::path& file) {

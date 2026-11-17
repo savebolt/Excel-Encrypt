@@ -17,6 +17,7 @@ std::wstring FromUtf8(const std::string& text);
 std::wstring Trim(const std::wstring& text);
 std::wstring Fit(const std::wstring& text, std::size_t width);
 std::wstring FormatSize(std::uintmax_t bytes);
+std::wstring Win32Text(unsigned long code);
 
 void InitConsole();
 std::wstring Paint(const std::wstring& text, Color color);
@@ -32,8 +33,22 @@ struct ScanResult {
     std::vector<std::wstring> errors;
 };
 
+enum class FileType { Excel, Word, Pdf, Other };
+
+struct FileTypes {
+    bool excel = true;
+    bool word = true;
+    bool pdf = true;
+    bool Any() const { return excel || word || pdf; }
+};
+
 bool IsExcelFile(const std::filesystem::path& file);
+bool IsWordFile(const std::filesystem::path& file);
+bool IsPdfFile(const std::filesystem::path& file);
 bool IsOoxml(const std::filesystem::path& file);
+FileType TypeOf(const std::filesystem::path& file);
+ScanResult ScanFiles(const std::filesystem::path& folder, bool recursive,
+                     const FileTypes& types);
 ScanResult ScanExcelFiles(const std::filesystem::path& folder, bool recursive);
 Container DetectContainer(const std::filesystem::path& file);
 std::wstring RelativeForDisplay(const std::filesystem::path& file,

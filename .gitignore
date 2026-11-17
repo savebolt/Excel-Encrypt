@@ -1,5 +1,5 @@
 # Build output
-/build/
+/build/\n/build-cmake/
 *.obj
 *.o
 *.pdb
@@ -10,6 +10,7 @@
 # Runtime artefacts
 *.bak
 *.log
+*.xlpt-tmp
 
 # Local encrypted test workbooks (not part of the source)
 /sheets/
