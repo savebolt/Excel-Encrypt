@@ -1,0 +1,15 @@
+# Build output
+/build/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Runtime artefacts
+*.bak
+*.log
+
+# Local encrypted test workbooks (not part of the source)
+/sheets/
