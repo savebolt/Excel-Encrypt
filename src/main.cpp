@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 
 #include <chrono>
 #include <cwchar>
@@ -19,12 +20,33 @@ using util::Paint;
 
 namespace {
 
+// Keep  - leave name.ext.bak next to the file (default)
+// Temp  - create the backup, delete it again when the file was processed OK
+// None  - do not create backups at all
+enum class BackupMode { Keep, Temp, None };
+
 struct Options {
     fs::path folder;
     bool recursive = false;
-    bool backups = true;
+    BackupMode backups = BackupMode::Keep;
     util::FileTypes types;
 };
+
+std::wstring BackupLabel(BackupMode mode) {
+    switch (mode) {
+        case BackupMode::Keep: return L"ON (keep .bak)";
+        case BackupMode::Temp: return L"TEMP (delete on success)";
+        default:               return L"OFF";
+    }
+}
+
+BackupMode NextBackupMode(BackupMode mode) {
+    switch (mode) {
+        case BackupMode::Keep: return BackupMode::Temp;
+        case BackupMode::Temp: return BackupMode::None;
+        default:               return BackupMode::Keep;
+    }
+}
 
 struct BatchStats {
     int done = 0;
@@ -51,7 +73,7 @@ void PrintSeparator() {
 void PrintBanner() {
     util::WriteLine();
     util::WriteLine(Paint(L"   " + std::wstring(60, L'='), Color::Cyan));
-    util::WriteLine(Paint(L"    Excel Password Tool   v1.1", Color::Bold));
+    util::WriteLine(Paint(L"    Excel Password Tool   v1.2", Color::Bold));
     util::WriteLine(L"    Encrypt / decrypt Excel, Word and PDF files with a password");
     util::WriteLine(Paint(L"   " + std::wstring(60, L'='), Color::Cyan));
 }
@@ -91,8 +113,7 @@ void PrintStatus(const Options& options, const util::ScanResult& scan) {
                     L", PDF " + std::to_wstring(pdf) + L")");
     util::WriteLine(L"   Types       : " + TypeSummary(options.types));
     util::WriteLine(L"   Subfolders  : " + std::wstring(options.recursive ? L"yes" : L"no"));
-    util::WriteLine(L"   Backups     : " +
-                    std::wstring(options.backups ? L"yes (plain .bak copies)" : L"no"));
+    util::WriteLine(L"   Backups     : " + BackupLabel(options.backups));
     for (const std::wstring& error : scan.errors) {
         util::WriteLine(Paint(L"   ! " + error, Color::Red));
     }
@@ -105,10 +126,11 @@ void PrintMenu(const Options& options) {
     util::WriteLine(L"   [3] Change folder");
     util::WriteLine(L"   [4] Include subfolders : " +
                     std::wstring(options.recursive ? L"ON" : L"OFF") + L"   (toggle)");
-    util::WriteLine(L"   [5] Backups            : " +
-                    std::wstring(options.backups ? L"ON" : L"OFF") + L"   (toggle)");
+    util::WriteLine(L"   [5] Backups            : " + BackupLabel(options.backups) +
+                    L"   (cycle)");
     util::WriteLine(L"   [6] List files");
     util::WriteLine(L"   [7] File types         : " + TypeSummary(options.types) + L"   (change)");
+    util::WriteLine(L"   [8] Browse for folder...");
     util::WriteLine(L"   [0] Exit");
     util::WriteLine();
 }
@@ -245,7 +267,7 @@ BatchStats RunBatch(const Options& options, const std::vector<fs::path>& files,
         }
 
         bool createdBackup = false;
-        if (options.backups) {
+        if (options.backups != BackupMode::None) {
             std::wstring backupError;
             if (!util::EnsureBackup(file, createdBackup, backupError)) {
                 util::WriteLine(Paint(L"FAILED", Color::Red));
@@ -302,10 +324,20 @@ BatchStats RunBatch(const Options& options, const std::vector<fs::path>& files,
             case FileAction::Encrypted:
                 util::WriteLine(Paint(L"encrypted", Color::Green));
                 ++stats.done;
+                if (options.backups == BackupMode::Temp) {
+                    fs::path backup = file;
+                    backup += L".bak";
+                    util::RemoveQuiet(backup);
+                }
                 break;
             case FileAction::Decrypted:
                 util::WriteLine(Paint(L"decrypted", Color::Green));
                 ++stats.done;
+                if (options.backups == BackupMode::Temp) {
+                    fs::path backup = file;
+                    backup += L".bak";
+                    util::RemoveQuiet(backup);
+                }
                 break;
             case FileAction::SkippedAlreadyEncrypted: {
                 util::WriteLine(Paint(L"skipped (already encrypted)", Color::Yellow));
@@ -373,8 +405,11 @@ void DoEncrypt(const Options& options, const util::ScanResult& scan) {
     util::WriteLine();
     util::WriteLine(L"   " + std::to_wstring(scan.files.size()) +
                     L" file(s) will be encrypted in place.");
-    if (options.backups) {
+    if (options.backups == BackupMode::Keep) {
         util::WriteLine(Paint(L"   A .bak copy is kept the first time; it stays unencrypted.",
+                              Color::Yellow));
+    } else if (options.backups == BackupMode::Temp) {
+        util::WriteLine(Paint(L"   A .bak copy is made first and deleted again when the file succeeds.",
                               Color::Yellow));
     }
 
@@ -397,8 +432,11 @@ void DoDecrypt(const Options& options, const util::ScanResult& scan) {
     util::WriteLine();
     util::WriteLine(L"   " + std::to_wstring(scan.files.size()) +
                     L" file(s) will be decrypted in place.");
-    if (options.backups) {
+    if (options.backups == BackupMode::Keep) {
         util::WriteLine(Paint(L"   A .bak copy is kept the first time.", Color::Yellow));
+    } else if (options.backups == BackupMode::Temp) {
+        util::WriteLine(Paint(L"   A .bak copy is made first and deleted again when the file succeeds.",
+                              Color::Yellow));
     }
 
     const std::wstring password = AskExistingPassword();
@@ -410,6 +448,47 @@ void DoDecrypt(const Options& options, const util::ScanResult& scan) {
         return;
     }
     RunBatch(options, scan.files, password, false);
+}
+
+// Native Windows folder picker (IFileOpenDialog with FOS_PICKFOLDERS).
+std::wstring PickFolder(const fs::path& initial) {
+    std::wstring result;
+
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || dialog == nullptr) {
+        return result;
+    }
+
+    DWORD flags = 0;
+    dialog->GetOptions(&flags);
+    dialog->SetOptions(flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dialog->SetTitle(L"Select the folder with the files to protect");
+
+    if (!initial.empty()) {
+        IShellItem* start = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr,
+                                                  IID_PPV_ARGS(&start)))) {
+            dialog->SetFolder(start);
+            start->Release();
+        }
+    }
+
+    if (SUCCEEDED(dialog->Show(GetConsoleWindow()))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                result = path;
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+
+    dialog->Release();
+    return result;
 }
 
 void ChangeFolder(Options& options) {
@@ -494,12 +573,19 @@ int RunInteractive(Options options) {
         } else if (choice == L"4") {
             options.recursive = !options.recursive;
         } else if (choice == L"5") {
-            options.backups = !options.backups;
+            options.backups = NextBackupMode(options.backups);
         } else if (choice == L"6") {
             ListFiles(options, scan);
             util::Pause();
         } else if (choice == L"7") {
             ChangeTypes(options);
+        } else if (choice == L"8") {
+            const std::wstring picked = PickFolder(options.folder);
+            if (!picked.empty()) {
+                options.folder = fs::path(picked);
+                util::WriteLine(Paint(L"   Folder set to " + options.folder.wstring(),
+                                      Color::Green));
+            }
         } else if (choice == L"0" || choice == L"q") {
             return 0;
         } else if (!choice.empty()) {
@@ -553,7 +639,7 @@ int RunOnce(const Options& options, bool encrypt, std::wstring password, bool as
 
 void PrintHelp() {
     util::WriteLine();
-    util::WriteLine(Paint(L"   Excel Password Tool 1.1", Color::Bold));
+    util::WriteLine(Paint(L"   Excel Password Tool 1.2", Color::Bold));
     util::WriteLine(L"   Encrypts Excel, Word and PDF files in a folder with one password, or");
     util::WriteLine(L"   removes the password again. Excel and Word are driven through COM,");
     util::WriteLine(L"   so those files get their real \"Encrypt with password\" protection.");
@@ -568,6 +654,7 @@ void PrintHelp() {
     util::WriteLine(L"     -r, --recursive        Include subfolders");
     util::WriteLine(L"         --types <list>     e=Excel w=Word p=PDF, e.g. \"ewp\" or \"all\"");
     util::WriteLine(L"         --no-backup        Do not keep .bak copies (default: keep)");
+    util::WriteLine(L"         --temp-backup      Make a .bak first, delete it when the file succeeds");
     util::WriteLine(L"     -y, --yes              Skip the confirmation question");
     util::WriteLine(L"     -h, --help             Show this help");
     util::WriteLine();
@@ -632,7 +719,9 @@ CommandLineOptions ParseCommandLine() {
         } else if (argument == L"-r" || argument == L"--recursive") {
             result.options.recursive = true;
         } else if (argument == L"--no-backup") {
-            result.options.backups = false;
+            result.options.backups = BackupMode::None;
+        } else if (argument == L"--temp-backup") {
+            result.options.backups = BackupMode::Temp;
         } else if (argument == L"--types") {
             if (needValue(index, argument)) {
                 const std::wstring value = util::ToLower(argv[index]);

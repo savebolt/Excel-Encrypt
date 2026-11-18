@@ -45,7 +45,7 @@ is the current working directory (when started from Explorer: the exe folder).
 
 ```
    ============================================================
-    Excel Password Tool   v1.1
+    Excel Password Tool   v1.2
     Encrypt / decrypt Excel, Word and PDF files with a password
    ============================================================
    Folder      : C:\Users\You\Documents\Reports
@@ -58,15 +58,17 @@ is the current working directory (when started from Explorer: the exe folder).
    [2] Decrypt all files  (remove the password)
    [3] Change folder
    [4] Include subfolders : OFF   (toggle)
-   [5] Backups            : ON    (toggle)
+   [5] Backups            : ON (keep .bak)   (cycle)
    [6] List files
    [7] File types         : Excel + Word + PDF   (change)
+   [8] Browse for folder...
    [0] Exit
 ```
 
 Menu 1 asks for the password twice, then for confirmation. Menu 2 asks for the
 existing password. The password is hidden while typing. Menu 7 limits the run
-to a combination of `e` (Excel), `w` (Word) and `p` (PDF).
+to a combination of `e` (Excel), `w` (Word) and `p` (PDF). Menu 8 opens the
+native Windows folder picker.
 
 ### Command line (scriptable, same engine)
 
@@ -87,6 +89,7 @@ ExcelPasswordTool.exe -e --types p -d "D:\Reports" -p "secret" -y
 | `-r, --recursive` | Include subfolders |
 | `--types <list>` | `e` Excel, `w` Word, `p` PDF - e.g. `ewp` or `all` |
 | `--no-backup` | Do not create `.bak` copies |
+| `--temp-backup` | Create a `.bak` first, delete it when the file succeeds |
 | `-y, --yes` | Skip the confirmation question |
 | `-h, --help` | Show help |
 
@@ -144,12 +147,19 @@ Notes:
 
 ## Backups
 
-Backups are **on by default**: the first time a file is processed,
-`name.ext.bak` is created next to it (only if that `.bak` does not already
-exist, so the oldest copy is kept).
+Menu `[5]` cycles through three modes:
 
-**The `.bak` copy is not encrypted.** Turn backups off with menu `[5]` or
-`--no-backup` if plain copies must not exist.
+| Mode | Behaviour |
+| --- | --- |
+| **ON (keep .bak)** | Default. `name.ext.bak` is created the first time a file is processed and kept. |
+| **TEMP (delete on success)** | A `.bak` is created before the file is touched, then deleted again once the file was processed successfully. If a file fails, its `.bak` stays behind so you can restore it. |
+| **OFF** | No backups at all. |
+
+In TEMP mode a successful run leaves no `.bak` files behind, so the folder stays
+clean while still having a safety net during the operation.
+
+**The `.bak` copy is not encrypted.** Use `--no-backup` if plain copies must
+never exist.
 
 ## Safety and limitations
 
