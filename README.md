@@ -96,10 +96,11 @@ ExcelPasswordTool.exe -e --types p -d "D:\Reports" -p "secret" -y
 
 Exit codes: `0` success, `1` some files failed, `2` usage/password error.
 
-Files are processed in parallel: Excel, Word and PDF each run at the same time,
-and each type gets several workers because Office spends most of its time
-encrypting, which is CPU bound. On a typical machine this is about three times
-faster than doing one file at a time. Use `--jobs` to change the worker count.
+Files are processed one type at a time, in a fixed order: **Excel, then Word,
+then PDF**. Within a type several workers run in parallel because Office spends
+most of its time encrypting, which is CPU bound. On a typical machine this is
+about three times faster than doing one file at a time. Use `--jobs` to change
+the worker count.
 
 Supported files:
 

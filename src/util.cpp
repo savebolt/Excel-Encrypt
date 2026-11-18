@@ -321,6 +321,11 @@ ScanResult ScanFiles(const std::filesystem::path& folder, bool recursive,
 
     std::sort(result.files.begin(), result.files.end(),
               [](const fs::path& left, const fs::path& right) {
+                  const int leftType = static_cast<int>(TypeOf(left));
+                  const int rightType = static_cast<int>(TypeOf(right));
+                  if (leftType != rightType) {
+                      return leftType < rightType;  // Excel, then Word, then PDF
+                  }
                   return ToLower(left.filename().wstring()) <
                          ToLower(right.filename().wstring());
               });

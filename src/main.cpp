@@ -384,15 +384,19 @@ BatchStats RunBatch(const Options& options, const std::vector<fs::path>& files,
         }
     };
 
-    std::vector<std::thread> threads;
     std::atomic<int> workerIndex{0};
 
-    auto spawn = [&](std::vector<fs::path>& group, util::FileType type, int cap) {
+    // One file type at a time, in a fixed order (Excel, Word, PDF), so the
+    // run is grouped by type. Inside a type several workers run in parallel
+    // because Office spends most of its time encrypting, which is CPU bound
+    // and scales well across instances.
+    auto runGroup = [&](std::vector<fs::path>& group, util::FileType type, int cap) {
         const int workers = WorkerCount(group.size(), options.jobs, cap);
         if (workers == 0) {
             return;
         }
         auto next = std::make_shared<std::atomic<std::size_t>>(0);
+        std::vector<std::thread> threads;
         for (int i = 0; i < workers; ++i) {
             threads.emplace_back([&, type, next]() {
                 CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -414,18 +418,14 @@ BatchStats RunBatch(const Options& options, const std::vector<fs::path>& files,
                 CoUninitialize();
             });
         }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
     };
 
-    // Excel, Word and PDF run at the same time; each type also gets several
-    // workers because Office spends most of its time encrypting, which is CPU
-    // bound and scales well across instances.
-    spawn(excelFiles, util::FileType::Excel, 3);
-    spawn(wordFiles, util::FileType::Word, 2);
-    spawn(pdfFiles, util::FileType::Pdf, 1);
-
-    for (std::thread& thread : threads) {
-        thread.join();
-    }
+    runGroup(excelFiles, util::FileType::Excel, 3);
+    runGroup(wordFiles, util::FileType::Word, 2);
+    runGroup(pdfFiles, util::FileType::Pdf, 1);
 
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
