@@ -2,10 +2,14 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 
+#include <atomic>
 #include <chrono>
 #include <cwchar>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -30,6 +34,7 @@ struct Options {
     bool recursive = false;
     BackupMode backups = BackupMode::Keep;
     util::FileTypes types;
+    int jobs = 0;  // 0 = choose automatically
 };
 
 std::wstring BackupLabel(BackupMode mode) {
@@ -73,7 +78,7 @@ void PrintSeparator() {
 void PrintBanner() {
     util::WriteLine();
     util::WriteLine(Paint(L"   " + std::wstring(60, L'='), Color::Cyan));
-    util::WriteLine(Paint(L"    Excel Password Tool   v1.2", Color::Bold));
+    util::WriteLine(Paint(L"    Excel Password Tool   v1.3", Color::Bold));
     util::WriteLine(L"    Encrypt / decrypt Excel, Word and PDF files with a password");
     util::WriteLine(Paint(L"   " + std::wstring(60, L'='), Color::Cyan));
 }
@@ -223,153 +228,204 @@ std::wstring AskExistingPassword() {
     return password;
 }
 
+// Office writes its own scratch files next to the target, so two workers
+// saving into the same folder can collide. Each worker gets a private folder.
+fs::path MakeWorkerTempDir(int workerIndex) {
+    wchar_t buffer[MAX_PATH] = {};
+    const DWORD length = GetTempPathW(MAX_PATH, buffer);
+    const fs::path base = length > 0 ? fs::path(std::wstring(buffer, length))
+                                     : fs::temp_directory_path();
+    const fs::path dir = base / (L"ExcelPasswordTool-" +
+                                 std::to_wstring(GetCurrentProcessId()) + L"-" +
+                                 std::to_wstring(workerIndex));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    if (!fs::is_directory(dir, ec)) {
+        return {};  // fall back to a sibling temp file
+    }
+    return dir;
+}
+
+int WorkerCount(std::size_t files, int requested, int cap) {
+    if (files == 0) {
+        return 0;
+    }
+    int workers = requested > 0 ? requested : static_cast<int>((files + 2) / 3);
+    if (requested <= 0 && workers > cap) {
+        workers = cap;
+    }
+    if (workers < 1) {
+        workers = 1;
+    }
+    if (workers > static_cast<int>(files)) {
+        workers = static_cast<int>(files);
+    }
+    return workers;
+}
+
 BatchStats RunBatch(const Options& options, const std::vector<fs::path>& files,
                     const std::wstring& password, bool encrypt) {
     BatchStats stats;
     std::vector<std::pair<std::wstring, std::wstring>> failures;
+    std::mutex outMutex;
 
-    ExcelApp excel;
-    WordApp word;
-    PdfTool pdf;
-
-    bool excelStarted = false;
-    bool wordStarted = false;
-    std::wstring excelError;
-    std::wstring wordError;
+    std::vector<fs::path> excelFiles;
+    std::vector<fs::path> wordFiles;
+    std::vector<fs::path> pdfFiles;
+    for (const fs::path& file : files) {
+        switch (util::TypeOf(file)) {
+            case util::FileType::Excel: excelFiles.push_back(file); break;
+            case util::FileType::Word:  wordFiles.push_back(file);  break;
+            case util::FileType::Pdf:   pdfFiles.push_back(file);   break;
+            default: break;
+        }
+    }
 
     const int total = static_cast<int>(files.size());
     const int digits = static_cast<int>(std::to_wstring(total).size());
     const auto started = std::chrono::steady_clock::now();
+    std::atomic<int> completed{0};
 
     util::WriteLine();
-    for (int index = 0; index < total; ++index) {
-        const fs::path& file = files[static_cast<std::size_t>(index)];
+
+    enum class Outcome { Done, Skipped, Failed };
+
+    auto processOne = [&](const fs::path& file, util::FileType type,
+                          ExcelApp& excel, WordApp& word, PdfTool& pdf,
+                          const fs::path& tempDir) {
         const std::wstring label = util::RelativeForDisplay(file, options.folder);
 
-        std::wstring counter = std::to_wstring(index + 1);
-        if (static_cast<int>(counter.size()) < digits) {
-            counter.insert(0, static_cast<std::size_t>(digits) - counter.size(), L' ');
-        }
-        util::Write(L"   [" + counter + L"/" + std::to_wstring(total) + L"] " +
-                    util::Fit(label, 44) + L"   ");
+        auto report = [&](Outcome outcome, const std::wstring& text, Color color,
+                          const std::wstring& detail = std::wstring()) {
+            std::lock_guard<std::mutex> lock(outMutex);
+            const int index = ++completed;
+            std::wstring counter = std::to_wstring(index);
+            if (static_cast<int>(counter.size()) < digits) {
+                counter.insert(0, static_cast<std::size_t>(digits) - counter.size(), L' ');
+            }
+            util::Write(L"   [" + counter + L"/" + std::to_wstring(total) + L"] " +
+                        util::Fit(label, 44) + L"   ");
+            util::WriteLine(Paint(text, color));
+            if (!detail.empty()) {
+                util::WriteLine(L"         " + Paint(detail, Color::Red));
+            }
+            switch (outcome) {
+                case Outcome::Done:    ++stats.done;    break;
+                case Outcome::Skipped: ++stats.skipped; break;
+                case Outcome::Failed:
+                    ++stats.failed;
+                    failures.emplace_back(label, detail);
+                    break;
+            }
+        };
 
-        const bool ooxml = util::IsOoxml(file);
-        const util::Container container = util::DetectContainer(file);
-        if (ooxml && encrypt && container == util::Container::Cfb) {
-            util::WriteLine(Paint(L"skipped (already encrypted)", Color::Yellow));
-            ++stats.skipped;
-            continue;
-        }
-        if (ooxml && !encrypt && container == util::Container::Zip) {
-            util::WriteLine(Paint(L"skipped (not encrypted)", Color::Yellow));
-            ++stats.skipped;
-            continue;
+        // For OOXML the container tells us the state without opening the file.
+        if (util::IsOoxml(file)) {
+            const util::Container container = util::DetectContainer(file);
+            if (encrypt && container == util::Container::Cfb) {
+                report(Outcome::Skipped, L"skipped (already encrypted)", Color::Yellow);
+                return;
+            }
+            if (!encrypt && container == util::Container::Zip) {
+                report(Outcome::Skipped, L"skipped (not encrypted)", Color::Yellow);
+                return;
+            }
         }
 
         bool createdBackup = false;
         if (options.backups != BackupMode::None) {
             std::wstring backupError;
             if (!util::EnsureBackup(file, createdBackup, backupError)) {
-                util::WriteLine(Paint(L"FAILED", Color::Red));
-                util::WriteLine(L"         " + Paint(backupError, Color::Red));
-                ++stats.failed;
-                failures.emplace_back(label, backupError);
-                continue;
+                report(Outcome::Failed, L"FAILED", Color::Red, backupError);
+                return;
             }
         }
 
-        const FileResult result = [&]() -> FileResult {
-            const util::FileType type = util::TypeOf(file);
-            if (type == util::FileType::Excel) {
-                if (!excelStarted) {
-                    excelStarted = true;
-                    try {
-                        excel.Start();
-                    } catch (const com::Error& error) {
-                        excelError = error.Message();
-                    }
-                }
-                if (!excelError.empty()) {
-                    FileResult failed;
-                    failed.detail = excelError;
-                    return failed;
-                }
-                return excel.ProcessFile(file.wstring(), password, encrypt);
-            }
-            if (type == util::FileType::Word) {
-                if (!wordStarted) {
-                    wordStarted = true;
-                    try {
-                        word.Start();
-                    } catch (const com::Error& error) {
-                        wordError = error.Message();
-                    }
-                }
-                if (!wordError.empty()) {
-                    FileResult failed;
-                    failed.detail = wordError;
-                    return failed;
-                }
-                return word.ProcessFile(file.wstring(), password, encrypt);
-            }
-            if (type == util::FileType::Pdf) {
-                return pdf.ProcessFile(file.wstring(), password, encrypt);
-            }
-            FileResult skipped;
-            skipped.action = FileAction::SkippedNotEncrypted;
-            skipped.detail = L"unsupported file type";
-            return skipped;
-        }();
+        FileResult result;
+        if (type == util::FileType::Excel) {
+            result = excel.ProcessFile(file.wstring(), password, encrypt, tempDir);
+        } else if (type == util::FileType::Word) {
+            result = word.ProcessFile(file.wstring(), password, encrypt, tempDir);
+        } else {
+            result = pdf.ProcessFile(file.wstring(), password, encrypt);
+        }
+
         switch (result.action) {
             case FileAction::Encrypted:
-                util::WriteLine(Paint(L"encrypted", Color::Green));
-                ++stats.done;
+            case FileAction::Decrypted: {
                 if (options.backups == BackupMode::Temp) {
                     fs::path backup = file;
                     backup += L".bak";
                     util::RemoveQuiet(backup);
                 }
-                break;
-            case FileAction::Decrypted:
-                util::WriteLine(Paint(L"decrypted", Color::Green));
-                ++stats.done;
-                if (options.backups == BackupMode::Temp) {
-                    fs::path backup = file;
-                    backup += L".bak";
-                    util::RemoveQuiet(backup);
-                }
-                break;
-            case FileAction::SkippedAlreadyEncrypted: {
-                util::WriteLine(Paint(L"skipped (already encrypted)", Color::Yellow));
-                ++stats.skipped;
-                if (createdBackup) {
-                    fs::path backup = file;
-                    backup += L".bak";
-                    util::RemoveQuiet(backup);
-                }
+                report(Outcome::Done,
+                       result.action == FileAction::Encrypted ? L"encrypted" : L"decrypted",
+                       Color::Green);
                 break;
             }
+            case FileAction::SkippedAlreadyEncrypted:
             case FileAction::SkippedNotEncrypted: {
-                util::WriteLine(Paint(L"skipped (not encrypted)", Color::Yellow));
-                ++stats.skipped;
                 if (createdBackup) {
                     fs::path backup = file;
                     backup += L".bak";
                     util::RemoveQuiet(backup);
                 }
+                report(Outcome::Skipped,
+                       result.action == FileAction::SkippedAlreadyEncrypted
+                           ? L"skipped (already encrypted)"
+                           : L"skipped (not encrypted)",
+                       Color::Yellow);
                 break;
             }
             case FileAction::Failed:
-                util::WriteLine(Paint(L"FAILED", Color::Red));
-                util::WriteLine(L"         " + Paint(result.detail, Color::Red));
-                ++stats.failed;
-                failures.emplace_back(label, result.detail);
+                report(Outcome::Failed, L"FAILED", Color::Red, result.detail);
                 break;
         }
-    }
+    };
 
-    excel.Stop();
-    word.Stop();
+    std::vector<std::thread> threads;
+    std::atomic<int> workerIndex{0};
+
+    auto spawn = [&](std::vector<fs::path>& group, util::FileType type, int cap) {
+        const int workers = WorkerCount(group.size(), options.jobs, cap);
+        if (workers == 0) {
+            return;
+        }
+        auto next = std::make_shared<std::atomic<std::size_t>>(0);
+        for (int i = 0; i < workers; ++i) {
+            threads.emplace_back([&, type, next]() {
+                CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+                const fs::path tempDir = MakeWorkerTempDir(workerIndex.fetch_add(1));
+                ExcelApp excel;
+                WordApp word;
+                PdfTool pdf;
+                for (;;) {
+                    const std::size_t index = next->fetch_add(1);
+                    if (index >= group.size()) {
+                        break;
+                    }
+                    processOne(group[index], type, excel, word, pdf, tempDir);
+                }
+                excel.Stop();
+                word.Stop();
+                std::error_code ec;
+                fs::remove_all(tempDir, ec);
+                CoUninitialize();
+            });
+        }
+    };
+
+    // Excel, Word and PDF run at the same time; each type also gets several
+    // workers because Office spends most of its time encrypting, which is CPU
+    // bound and scales well across instances.
+    spawn(excelFiles, util::FileType::Excel, 3);
+    spawn(wordFiles, util::FileType::Word, 2);
+    spawn(pdfFiles, util::FileType::Pdf, 1);
+
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
 
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -639,7 +695,7 @@ int RunOnce(const Options& options, bool encrypt, std::wstring password, bool as
 
 void PrintHelp() {
     util::WriteLine();
-    util::WriteLine(Paint(L"   Excel Password Tool 1.2", Color::Bold));
+    util::WriteLine(Paint(L"   Excel Password Tool 1.3", Color::Bold));
     util::WriteLine(L"   Encrypts Excel, Word and PDF files in a folder with one password, or");
     util::WriteLine(L"   removes the password again. Excel and Word are driven through COM,");
     util::WriteLine(L"   so those files get their real \"Encrypt with password\" protection.");
@@ -655,6 +711,7 @@ void PrintHelp() {
     util::WriteLine(L"         --types <list>     e=Excel w=Word p=PDF, e.g. \"ewp\" or \"all\"");
     util::WriteLine(L"         --no-backup        Do not keep .bak copies (default: keep)");
     util::WriteLine(L"         --temp-backup      Make a .bak first, delete it when the file succeeds");
+    util::WriteLine(L"         --jobs <n>         Parallel workers per file type (1-8, default auto)");
     util::WriteLine(L"     -y, --yes              Skip the confirmation question");
     util::WriteLine(L"     -h, --help             Show this help");
     util::WriteLine();
@@ -722,6 +779,17 @@ CommandLineOptions ParseCommandLine() {
             result.options.backups = BackupMode::None;
         } else if (argument == L"--temp-backup") {
             result.options.backups = BackupMode::Temp;
+        } else if (argument == L"--jobs") {
+            if (needValue(index, argument)) {
+                wchar_t* end = nullptr;
+                const long value = wcstol(argv[index], &end, 10);
+                if (end == argv[index] || value < 1 || value > 8) {
+                    result.bad = true;
+                    result.error = L"--jobs needs a number from 1 to 8";
+                } else {
+                    result.options.jobs = static_cast<int>(value);
+                }
+            }
         } else if (argument == L"--types") {
             if (needValue(index, argument)) {
                 const std::wstring value = util::ToLower(argv[index]);

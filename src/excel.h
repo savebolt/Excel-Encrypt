@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <filesystem>
 #include <string>
 
 #include "com.h"
@@ -26,7 +27,8 @@ public:
     void Stop();
     bool Running() const { return static_cast<bool>(app_); }
 
-    FileResult ProcessFile(const std::wstring& path, const std::wstring& password, bool encrypt);
+    FileResult ProcessFile(const std::wstring& path, const std::wstring& password, bool encrypt,
+                           const std::filesystem::path& tempDir = {});
 
 private:
     void Configure();

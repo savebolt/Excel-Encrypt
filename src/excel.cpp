@@ -114,14 +114,27 @@ void ExcelApp::Configure() {
     setBool(L"EnableEvents", false);
     setBool(L"Interactive", false);
     setBool(L"AskToUpdateLinks", false);
+    setBool(L"DisplayStatusBar", false);
+    setBool(L"EnableAnimations", false);
+    setBool(L"AlertBeforeOverwriting", false);
     try {
         com::PutLong(app_.Get(), L"AutomationSecurity", 3);  // msoAutomationSecurityForceDisable
+    } catch (...) {
+    }
+    try {
+        com::PutLong(app_.Get(), L"FeatureInstall", 0);  // msoFeatureInstallNone
+    } catch (...) {
+    }
+    try {
+        // AutoRecover writes a copy on every save; pointless for a batch run.
+        com::ComPtr autoRecover = com::GetObject(app_.Get(), L"AutoRecover");
+        com::PutBool(autoRecover.Get(), L"Enabled", false);
     } catch (...) {
     }
 }
 
 FileResult ExcelApp::ProcessFile(const std::wstring& path, const std::wstring& password,
-                                 bool encrypt) {
+                                 bool encrypt, const std::filesystem::path& tempDir) {
     FileResult result;
     result.action = FileAction::Failed;
 
@@ -140,6 +153,7 @@ FileResult ExcelApp::ProcessFile(const std::wstring& path, const std::wstring& p
     bool opened = false;
     bool closeFailed = false;
     std::wstring failure;
+    std::filesystem::path tempPath;
 
     try {
         com::ComPtr workbooks = com::GetObject(app_.Get(), L"Workbooks");
@@ -164,6 +178,12 @@ FileResult ExcelApp::ProcessFile(const std::wstring& path, const std::wstring& p
         workbook = com::CallObject(workbooks.Get(), L"Open", openArgs);
         opened = true;
 
+        // Excel only accepts this once a workbook is open.
+        try {
+            com::PutLong(app_.Get(), L"Calculation", -4135);  // xlCalculationManual
+        } catch (...) {
+        }
+
         const bool hasPassword = com::GetBool(workbook.Get(), L"HasPassword");
         if (encrypt && hasPassword) {
             result.action = FileAction::SkippedAlreadyEncrypted;
@@ -176,8 +196,19 @@ FileResult ExcelApp::ProcessFile(const std::wstring& path, const std::wstring& p
                 com::PutString(workbook.Get(), L"WritePassword", L"");
             }
 
+            // Excel takes roughly twice as long to overwrite the file it has
+            // open, so write a sibling temp file and swap it in afterwards.
+            const std::filesystem::path original(path);
+            if (!tempDir.empty()) {
+                tempPath = tempDir / original.filename();
+            } else {
+                tempPath = original;
+                tempPath += L".xlpt-tmp";
+                tempPath += original.extension();
+            }
+
             com::ArgList saveArgs(6);
-            saveArgs.SetString(1, path);                      // Filename
+            saveArgs.SetString(1, tempPath.wstring());        // Filename
             saveArgs.SetLong(2, SaveFormatFor(path));         // FileFormat
             saveArgs.SetString(3, encrypt ? password : L"");  // Password
             saveArgs.SetString(4, L"");                       // WriteResPassword
@@ -190,7 +221,24 @@ FileResult ExcelApp::ProcessFile(const std::wstring& path, const std::wstring& p
             com::CallVoid(workbook.Get(), L"Close", closeArgs);
             opened = false;
 
-            result.action = encrypt ? FileAction::Encrypted : FileAction::Decrypted;
+            bool good = true;
+            if (util::IsOoxml(original)) {
+                const util::Container container = util::DetectContainer(tempPath);
+                good = encrypt ? container == util::Container::Cfb
+                               : container == util::Container::Zip;
+            }
+            if (!good) {
+                util::RemoveQuiet(tempPath);
+                failure = L"the saved file does not look right - the original was left untouched";
+            } else if (!MoveFileExW(tempPath.c_str(), original.c_str(),
+                                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH |
+                                        MOVEFILE_COPY_ALLOWED)) {
+                const DWORD code = GetLastError();
+                util::RemoveQuiet(tempPath);
+                failure = L"could not replace the file: " + util::Win32Text(code);
+            } else {
+                result.action = encrypt ? FileAction::Encrypted : FileAction::Decrypted;
+            }
         }
     } catch (const com::Error& error) {
         failure = error.Message();
@@ -226,22 +274,12 @@ FileResult ExcelApp::ProcessFile(const std::wstring& path, const std::wstring& p
     }
 
     if (!failure.empty()) {
+        if (!tempPath.empty()) {
+            util::RemoveQuiet(tempPath);
+        }
         result.action = FileAction::Failed;
         result.detail = failure;
         return result;
-    }
-
-    if (result.action == FileAction::Encrypted || result.action == FileAction::Decrypted) {
-        const std::filesystem::path file(path);
-        if (util::IsOoxml(file)) {
-            const util::Container container = util::DetectContainer(file);
-            const bool good = encrypt ? container == util::Container::Cfb
-                                      : container == util::Container::Zip;
-            if (!good) {
-                result.action = FileAction::Failed;
-                result.detail = L"the saved file does not look right - restore the .bak copy and try again";
-            }
-        }
     }
 
     return result;

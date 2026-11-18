@@ -139,12 +139,23 @@ void WordApp::Configure() {
     try {
         com::ComPtr options = com::GetObject(app_.Get(), L"Options");
         com::PutBool(options.Get(), L"UpdateLinksAtOpen", false);
+        // Word repaginates and runs spell/grammar checks on open; none of that
+        // matters when the document is only opened to be re-saved.
+        com::PutBool(options.Get(), L"Pagination", false);
+        com::PutBool(options.Get(), L"BackgroundSave", false);
+        com::PutLong(options.Get(), L"SaveInterval", 0);
+        com::PutBool(options.Get(), L"CheckSpellingAsYouType", false);
+        com::PutBool(options.Get(), L"CheckGrammarAsYouType", false);
+        com::PutBool(options.Get(), L"ConfirmConversions", false);
+        com::PutBool(options.Get(), L"ConfirmFileFormatConversionOnOpen", false);
+        com::PutBool(options.Get(), L"WarnBeforeSavingPrintingSendingMarkup", false);
+        com::PutBool(options.Get(), L"SavePropertiesPrompt", false);
     } catch (...) {
     }
 }
 
 FileResult WordApp::ProcessFile(const std::wstring& path, const std::wstring& password,
-                                bool encrypt) {
+                                bool encrypt, const std::filesystem::path& tempDir) {
     FileResult result;
     result.action = FileAction::Failed;
 
@@ -205,9 +216,13 @@ FileResult WordApp::ProcessFile(const std::wstring& path, const std::wstring& pa
             // file, so write to a sibling temp file and swap it in after a
             // successful, verified save.
             const std::filesystem::path original(path);
-            tempPath = original;
-            tempPath += L".xlpt-tmp";
-            tempPath += original.extension();
+            if (!tempDir.empty()) {
+                tempPath = tempDir / original.filename();
+            } else {
+                tempPath = original;
+                tempPath += L".xlpt-tmp";
+                tempPath += original.extension();
+            }
 
             com::ArgList saveArgs(17);
             saveArgs.SetString(1, tempPath.wstring());        // FileName
@@ -244,7 +259,8 @@ FileResult WordApp::ProcessFile(const std::wstring& path, const std::wstring& pa
                 util::RemoveQuiet(tempPath);
                 failure = L"the saved file does not look right - the original was left untouched";
             } else if (!MoveFileExW(tempPath.c_str(), original.c_str(),
-                                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH |
+                                        MOVEFILE_COPY_ALLOWED)) {
                 const DWORD code = GetLastError();
                 util::RemoveQuiet(tempPath);
                 failure = L"could not replace the file: " + util::Win32Text(code);

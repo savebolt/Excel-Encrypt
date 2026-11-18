@@ -45,7 +45,7 @@ is the current working directory (when started from Explorer: the exe folder).
 
 ```
    ============================================================
-    Excel Password Tool   v1.2
+    Excel Password Tool   v1.3
     Encrypt / decrypt Excel, Word and PDF files with a password
    ============================================================
    Folder      : C:\Users\You\Documents\Reports
@@ -90,10 +90,16 @@ ExcelPasswordTool.exe -e --types p -d "D:\Reports" -p "secret" -y
 | `--types <list>` | `e` Excel, `w` Word, `p` PDF - e.g. `ewp` or `all` |
 | `--no-backup` | Do not create `.bak` copies |
 | `--temp-backup` | Create a `.bak` first, delete it when the file succeeds |
+| `--jobs <n>` | Parallel workers per file type (1-8, default auto) |
 | `-y, --yes` | Skip the confirmation question |
 | `-h, --help` | Show help |
 
 Exit codes: `0` success, `1` some files failed, `2` usage/password error.
+
+Files are processed in parallel: Excel, Word and PDF each run at the same time,
+and each type gets several workers because Office spends most of its time
+encrypting, which is CPU bound. On a typical machine this is about three times
+faster than doing one file at a time. Use `--jobs` to change the worker count.
 
 Supported files:
 
